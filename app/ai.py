@@ -1,46 +1,36 @@
 """
 AI functionality for Sugar-AI, including RAG and LLM components.
 """
-
 import os
 import torch
-import logging
-
 from transformers import pipeline
-from typing import Optional, List
-
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import CrossEncoder
-
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from typing import Optional, List
 import app.prompts as prompts
 from app.config import settings
+import logging
+
+from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger("sugar-ai")
 
 
-# ------------------------------------------------
-# Utility functions
-# ------------------------------------------------
-
 def format_docs(docs):
-    """Return document content separated by newlines"""
     return "\n\n".join(doc.page_content for doc in docs)
 
 
 def combine_messages(x):
-    """Combine message content with newlines"""
     if hasattr(x, "to_messages"):
         return "\n".join(msg.content for msg in x.to_messages())
     return str(x)
 
 
 def extract_answer_from_output(outputs):
-    """Extract the answer text from model output safely."""
     if not outputs:
         return ""
 
@@ -59,82 +49,38 @@ def extract_answer_from_output(outputs):
     return generated_text.strip()
 
 
-# ------------------------------------------------
-# RAG Agent
-# ------------------------------------------------
-
 class RAGAgent:
     """Retrieval-Augmented Generation agent for Sugar-AI"""
 
-    def __init__(
-        self,
-        model: Optional[str] = None,
-        quantize: bool = True,
-        use_reranker: bool = True,
-    ):
-
-        # ------------------------------------------------
-        # Model selection logic
-        # ------------------------------------------------
+    def __init__(self, model: Optional[str] = None, quantize: bool = True, use_reranker: bool = True):
 
         if model:
             self.model_name = model
-            logger.info("Using explicit model: %s", self.model_name)
-
+            logger.info("Using explicit model argument: %s", self.model_name)
         else:
             if getattr(settings, "DEV_MODE", False):
-                self.model_name = getattr(
-                    settings,
-                    "DEV_MODEL_NAME",
-                    settings.DEFAULT_MODEL,
-                )
-                logger.info("DEV_MODE active: using %s", self.model_name)
-
+                self.model_name = getattr(settings, "DEV_MODEL_NAME", settings.DEFAULT_MODEL)
             else:
-                self.model_name = getattr(
-                    settings,
-                    "PROD_MODEL_NAME",
-                    settings.DEFAULT_MODEL,
-                )
-                logger.info("Using production model %s", self.model_name)
+                self.model_name = getattr(settings, "PROD_MODEL_NAME", settings.DEFAULT_MODEL)
 
-        # ------------------------------------------------
-        # Device + quantization logic
-        # ------------------------------------------------
-
-        self.use_quant = quantize and torch.cuda.is_available()
-
-        device = 0 if torch.cuda.is_available() else -1
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-        # ------------------------------------------------
-        # Load LLM
-        # ------------------------------------------------
+        self.use_quant = quantize and torch.cuda.is_available() and not getattr(settings, "DEV_MODE", False)
+        device = 0 if torch.cuda.is_available() and not getattr(settings, "DEV_MODE", False) else -1
+        dtype = torch.float16 if device == 0 else torch.float32
 
         if self.use_quant:
-
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoTokenizer,
-                BitsAndBytesConfig,
-            )
-
-            logger.info("Loading model with 4bit quantization")
-
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
+                bnb_4bit_quant_type="nf4"
             )
 
             tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-
             model_obj = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 quantization_config=bnb_config,
                 torch_dtype=torch.float16,
-                device_map="auto",
+                device_map="auto"
             )
 
             self.model = pipeline(
@@ -148,9 +94,6 @@ class RAGAgent:
             self.simplify_model = self.model
 
         else:
-
-            logger.info("Loading model without quantization")
-
             self.model = pipeline(
                 "text-generation",
                 model=self.model_name,
@@ -162,148 +105,64 @@ class RAGAgent:
 
             self.simplify_model = self.model
 
-        # ------------------------------------------------
-        # Reranker
-        # ------------------------------------------------
-
+    
         self.use_reranker = use_reranker
-
         if self.use_reranker:
             logger.info("Loading reranker model")
             self.reranker = CrossEncoder("BAAI/bge-reranker-base")
 
-        # ------------------------------------------------
-        # RAG Components
-        # ------------------------------------------------
-
         self.retriever: Optional[FAISS] = None
 
-        self.prompt = ChatPromptTemplate.from_template(
-            prompts.PROMPT_TEMPLATE
-        )
-
-        self.child_prompt = ChatPromptTemplate.from_template(
-            prompts.CHILD_FRIENDLY_PROMPT
-        )
-
-        self.debug_prompt = ChatPromptTemplate.from_template(
-            prompts.CODE_DEBUG_PROMPT
-        )
-
-        self.context_prompt = ChatPromptTemplate.from_template(
-            prompts.CODE_CONTEXT_PROMPT
-        )
-
-        self.kids_debug_prompt = ChatPromptTemplate.from_template(
-            prompts.KIDS_DEBUG_PROMPT
-        )
-
-        self.kids_context_prompt = ChatPromptTemplate.from_template(
-            prompts.KIDS_CONTEXT_PROMPT
-        )
-
-    # ------------------------------------------------
-    # Model control
-    # ------------------------------------------------
+        self.prompt = ChatPromptTemplate.from_template(prompts.PROMPT_TEMPLATE)
+        self.child_prompt = ChatPromptTemplate.from_template(prompts.CHILD_FRIENDLY_PROMPT)
+        self.debug_prompt = ChatPromptTemplate.from_template(prompts.CODE_DEBUG_PROMPT)
+        self.context_prompt = ChatPromptTemplate.from_template(prompts.CODE_CONTEXT_PROMPT)
+        self.kids_debug_prompt = ChatPromptTemplate.from_template(prompts.KIDS_DEBUG_PROMPT)
+        self.kids_context_prompt = ChatPromptTemplate.from_template(prompts.KIDS_CONTEXT_PROMPT)
 
     def set_model(self, model: str) -> None:
-        """Update the model used by the agent"""
-
         self.model_name = model
-
         self.model = pipeline(
             "text-generation",
             model=self.model_name,
             max_length=1024,
             truncation=True,
+            torch_dtype=torch.float16
         )
 
         self.simplify_model = self.model
 
-    # ------------------------------------------------
-    # Vectorstore setup
-    # ------------------------------------------------
-
     def setup_vectorstore(self, file_paths: List[str]) -> Optional[FAISS]:
-        """Load documents, split into chunks, and create a vector store"""
-
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-
         all_documents = []
 
         for file_path in file_paths:
-            print(f"[DEBUG] Checking file: {file_path}")
-            print(f"[DEBUG] Exists: {os.path.exists(file_path)}")
-
             if os.path.exists(file_path):
-
                 if file_path.endswith(".pdf"):
                     loader = PyMuPDFLoader(file_path)
                 else:
                     loader = TextLoader(file_path)
 
                 documents = loader.load()
-                print(f"[DEBUG] Loaded {len(documents)} raw documents")
+                all_documents.extend(documents)
 
-                # ✅ IMPORTANT: Chunking
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=300,
-                    chunk_overlap=50
-            )
-
-                split_docs = text_splitter.split_documents(documents)
-                print(f"[DEBUG] Created {len(split_docs)} chunks")
-
-                all_documents.extend(split_docs)
-
-            else:
-                print(f"[ERROR] File NOT found: {file_path}")
-
-        print(f"[DEBUG] Total chunks collected: {len(all_documents)}")
-
-        # ❌ DO NOT silently fail
-        if not all_documents:
-            raise ValueError("No documents loaded. Check file paths and content.")
-
-        # Embeddings
         embeddings = HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5"
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
         vector_store = FAISS.from_documents(all_documents, embeddings)
-
-        # Debug: total stored docs
-        print("Total chunks in vectorstore:", len(vector_store.docstore._dict))
-
         self.retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
         return self.retriever
-    
-    # # ------------------------------------------------
-    # # Retrieval
-    # # ------------------------------------------------
-    def retrieve_documents(self, query: str, k: int = 5):
 
-        if not self.retriever:
-            raise ValueError(
-                "Vector store not initialized. Call setup_vectorstore() first."
-            )
-
+    def get_relevant_document(self, query: str):
         results = self.retriever.invoke(query)
-
-        return results[:k]
-
-    # ------------------------------------------------
-    # Reranking
-    # ------------------------------------------------
+        return results if results else []
 
     def rerank_documents(self, query: str, docs, top_k: int = 2):
-
         if not self.use_reranker or not docs:
             return docs[:top_k]
 
         pairs = [(query, doc.page_content) for doc in docs]
-
         scores = self.reranker.predict(pairs)
 
         ranked = sorted(
@@ -313,10 +172,6 @@ class RAGAgent:
         )
 
         return [doc for doc, _ in ranked[:top_k]]
-
-    # ------------------------------------------------
-    # Debugging chain
-    # ------------------------------------------------
 
     def debug(self, code: str, context: bool) -> str:
 
@@ -347,39 +202,33 @@ class RAGAgent:
 
         return debug_chain.invoke({"code": code})
 
-    # ------------------------------------------------
-    # Main RAG pipeline
-    # ------------------------------------------------
-
     def run(self, question: str) -> str:
         if not self.retriever:
             raise ValueError("Vector store not initialized.")
 
-        # 1. Retrieval + Reranking
-        docs = self.retrieve_documents(question, k=5)
-        print("Retrieved docs:", len(docs))
-
-        top_docs = self.rerank_documents(question, docs, top_k=2)
-        print("Top docs after rerank:", len(top_docs))
+        docs = self.get_relevant_document(question)
+        top_docs = self.rerank_documents(question, docs, top_k=1)
 
         context = format_docs(top_docs)
 
-        # 2. Better prompt (IMPORTANT)
-        first_response = self.run_with_custom_prompt(
-            question=question,
-            custom_prompt=f"""
-    Use ONLY the context below to answer the question.
-    If the answer is not in the context, say "I don't know".
+        chain_input = {
+            "context": lambda _: context,
+            "question": RunnablePassthrough()
+        }
 
-    Context:
-    {context}
-
-    Question:
-    {question}
-    """
+        first_chain = (
+            chain_input
+            | self.prompt
+            | combine_messages
+            | self.model
+            | extract_answer_from_output
         )
 
-        # 3. Child-friendly rewrite
+        first_response = first_chain.invoke({
+            "context": context,
+            "question": question
+        })
+
         second_chain = (
             {"original_answer": lambda x: x}
             | self.child_prompt
@@ -458,7 +307,8 @@ class RAGAgent:
             role = msg.get("role")
             content = msg.get("content", "")
 
-            if role == "assistant":
+            # Convert assistant to model only for Gemma-style chat templates
+            if role == "assistant" and "gemma" in str(self.model_name).lower():
                 role = "model"
 
             if role == "user" and i == 0 and first_role == "user" and system_content:
@@ -529,4 +379,3 @@ class RAGAgent:
 
         except Exception as e:
             raise Exception(f"Error generating chat completion: {str(e)}")
-

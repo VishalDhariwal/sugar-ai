@@ -17,44 +17,48 @@
 """
 Main entry point for Sugar-AI application.
 """
+
 import uvicorn
 import logging
+from sqlalchemy.orm import Session
 import os
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
+
+from app import create_app
+from app.ai import RAGAgent
 from app.database import get_db
 from app.auth import sync_env_keys_to_db
 from app.config import settings
-from app import create_app
+from app.routes import api
 
-# Setup logging
+# setup logging
 logger = logging.getLogger("sugar-ai")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Handles the startup and shutdown lifecycle of the application.
-    Replaces the deprecated @app.on_event("startup") and "shutdown".
-    """
-    # --- Startup Logic ---
-    try:
-        db = next(get_db())
-        sync_env_keys_to_db(db)
-        logger.info(f"Starting Sugar-AI with model: {settings.DEFAULT_MODEL}")
-    except Exception as e:
-        logger.error(f"Failed to initialize app during startup: {e}")
-        raise e
-
-    yield 
-    
-    # --- Shutdown Logic ---
-    logger.info("Shutting down Sugar-AI...")
-
 app = create_app()
-app.router.lifespan_context = lifespan
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize data on app startup"""
+    db = next(get_db())
+    sync_env_keys_to_db(db)
+    if settings.DEV_MODE:
+        active_model = settings.DEV_MODEL_NAME
+        logger.info(f"DEV_MODE active. Loading lightweight model: {active_model}")
+    else:
+        active_model = settings.PROD_MODEL_NAME
+        logger.info(f"PRODUCTION mode. Loading full model: {active_model}")
+
+    initialized_agent = RAGAgent(model=active_model)
+    initialized_agent.retriever = initialized_agent.setup_vectorstore(settings.DOC_PATHS)
+
+    # Inject this instance into the API module
+    # This updates the 'agent = None' in api.py to be the real loaded model
+    api.agent = initialized_agent
+    
+    app.state.agent = initialized_agent
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"Starting Sugar-AI on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
+
