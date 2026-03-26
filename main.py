@@ -14,11 +14,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-# Copyright (C) 2024 Sugar Labs, Inc.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License...
-
 """
 Main entry point for Sugar-AI application.
 """
@@ -33,6 +28,8 @@ from app import create_app
 from app.database import get_db, create_tables
 from app.auth import sync_env_keys_to_db
 from app.config import settings
+from app.routes import api
+from app.ai import RAGAgent
 
 # Setup logging
 logger = logging.getLogger("sugar-ai")
@@ -42,13 +39,29 @@ logger = logging.getLogger("sugar-ai")
 async def lifespan(app: FastAPI):
     """
     Handles the startup and shutdown lifecycle of the application.
+    Replaces deprecated @app.on_event.
     """
     try:
         db = next(get_db())
         sync_env_keys_to_db(db)
         create_tables()
 
-        logger.info(f"Starting Sugar-AI with model: {settings.DEFAULT_MODEL}")
+        if getattr(settings, "DEV_MODE", False):
+            active_model = getattr(settings, "DEV_MODEL_NAME", settings.DEFAULT_MODEL)
+            logger.info(f"DEV_MODE active. Loading model: {active_model}")
+        else:
+            active_model = getattr(settings, "PROD_MODEL_NAME", settings.DEFAULT_MODEL)
+            logger.info(f"PRODUCTION mode. Loading model: {active_model}")
+
+        initialized_agent = RAGAgent(model=active_model)
+        initialized_agent.retriever = initialized_agent.setup_vectorstore(settings.DOC_PATHS)
+
+        # Inject into API
+        api.agent = initialized_agent
+        app.state.agent = initialized_agent
+
+        logger.info(f"Starting Sugar-AI with model: {active_model}")
+
     except Exception as e:
         logger.error(f"Failed to initialize app during startup: {e}")
         raise e
